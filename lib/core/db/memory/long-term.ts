@@ -1,0 +1,461 @@
+import { db, schema } from '@/lib/core/db';
+import {
+  type HybridSearchRow,
+  getHybridCandidateLimit,
+  mergeHybridSearchCandidates,
+} from '@/lib/memory/search';
+import { createLogger } from '@/lib/utils/logger';
+import { and, cosineDistance, desc, eq, sql } from 'drizzle-orm';
+
+const logger = createLogger('db.memory.long_term');
+
+type LongTermChunkInput = {
+  chunkIndex: number;
+  content: string;
+  embedding?: number[] | null;
+  embeddingModel?: string | null;
+  embeddingDimensions?: number | null;
+};
+
+function buildSearchTextPreview(value?: string) {
+  const normalized = value?.trim().replace(/\s+/g, ' ') ?? '';
+
+  if (normalized.length <= 120) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, 117)}...`;
+}
+
+function roundScore(value: number) {
+  return Number(value.toFixed(4));
+}
+
+function summarizeHybridRows(rows: HybridSearchRow[]) {
+  return rows.slice(0, 5).map((row) => ({
+    chunkId: row.chunkId,
+    memoryId: row.memoryId,
+    vectorScore: roundScore(row.vectorScore),
+    keywordScore: roundScore(row.keywordScore),
+    finalScore: roundScore(row.finalScore),
+  }));
+}
+
+function containsCjk(value: string) {
+  return /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7af]/u.test(value);
+}
+
+function escapeLikePattern(value: string) {
+  return value
+    .replaceAll('\\', '\\\\')
+    .replaceAll('%', '\\%')
+    .replaceAll('_', '\\_');
+}
+
+export async function createLongTermMemoryRow(content: string) {
+  const [row] = await db
+    .insert(schema.longTermMemories)
+    .values({
+      content,
+      userId: 'system',
+    })
+    .returning();
+
+  return row;
+}
+
+export async function getLongTermMemoryRow(id: string) {
+  const [row] = await db
+    .select()
+    .from(schema.longTermMemories)
+    .where(eq(schema.longTermMemories.id, id))
+    .limit(1);
+
+  return row ?? null;
+}
+
+export async function listLongTermMemoryRows(options?: {
+  limit?: number;
+  offset?: number;
+}) {
+  const safeLimit = Math.max(1, Math.min(options?.limit ?? 100, 200));
+  const safeOffset = Math.max(0, options?.offset ?? 0);
+
+  return db
+    .select()
+    .from(schema.longTermMemories)
+    .orderBy(desc(schema.longTermMemories.updatedAt))
+    .limit(safeLimit)
+    .offset(safeOffset);
+}
+
+export async function listAllLongTermMemoryRows() {
+  return db
+    .select()
+    .from(schema.longTermMemories)
+    .orderBy(desc(schema.longTermMemories.updatedAt));
+}
+
+export async function updateLongTermMemoryRow(id: string, content: string) {
+  const [row] = await db
+    .update(schema.longTermMemories)
+    .set({ content, updatedAt: new Date() })
+    .where(eq(schema.longTermMemories.id, id))
+    .returning();
+
+  return row ?? null;
+}
+
+export async function deleteLongTermMemoryRow(id: string) {
+  const [row] = await db
+    .delete(schema.longTermMemories)
+    .where(eq(schema.longTermMemories.id, id))
+    .returning();
+
+  return row ?? null;
+}
+
+export async function replaceLongTermMemoryChunks(
+  memoryId: string,
+  chunks: LongTermChunkInput[],
+) {
+  if (chunks.length === 0) {
+    return;
+  }
+
+  logger.info('replace_chunks:start', {
+    memoryId,
+    chunkCount: chunks.length,
+    embeddedChunkCount: chunks.filter(
+      (chunk) => Array.isArray(chunk.embedding) && chunk.embedding.length > 0,
+    ).length,
+    embeddingModels: [...new Set(chunks.map((chunk) => chunk.embeddingModel))],
+    embeddingDimensions: [
+      ...new Set(chunks.map((chunk) => chunk.embeddingDimensions ?? null)),
+    ],
+  });
+
+  await db.batch([
+    db
+      .delete(schema.longTermMemoryChunks)
+      .where(eq(schema.longTermMemoryChunks.memoryId, memoryId)),
+    db.insert(schema.longTermMemoryChunks).values(
+      chunks.map((chunk) => ({
+        memoryId,
+        chunkIndex: chunk.chunkIndex,
+        content: chunk.content,
+        embedding: chunk.embedding ?? null,
+        embeddingModel: chunk.embeddingModel ?? null,
+        embeddingDimensions:
+          chunk.embeddingDimensions ?? chunk.embedding?.length ?? null,
+        tsv: sql`to_tsvector('simple', ${chunk.content})`,
+      })),
+    ),
+  ]);
+
+  logger.info('replace_chunks:success', {
+    memoryId,
+    chunkCount: chunks.length,
+  });
+}
+
+export async function listLongTermMemoryChunksForMemory(memoryId: string) {
+  return db
+    .select()
+    .from(schema.longTermMemoryChunks)
+    .where(eq(schema.longTermMemoryChunks.memoryId, memoryId))
+    .orderBy(schema.longTermMemoryChunks.chunkIndex);
+}
+
+async function listKeywordCandidateRows(options: {
+  searchText: string;
+  candidateLimit: number;
+}) {
+  const normalizedSearchText = options.searchText.trim();
+  const likePattern = `%${escapeLikePattern(normalizedSearchText)}%`;
+  const useSubstringFallback = containsCjk(normalizedSearchText);
+
+  if (useSubstringFallback) {
+    const substringScoreExpr = sql<number>`case when ${schema.longTermMemoryChunks.content} ilike ${likePattern} escape '\\' then 1 else 0 end`;
+
+    return db
+      .select({
+        chunkId: schema.longTermMemoryChunks.id,
+        memoryId: schema.longTermMemoryChunks.memoryId,
+        content: schema.longTermMemoryChunks.content,
+        keywordScore: substringScoreExpr,
+      })
+      .from(schema.longTermMemoryChunks)
+      .where(
+        sql`${schema.longTermMemoryChunks.content} ilike ${likePattern} escape '\\'`,
+      )
+      .orderBy(
+        sql`${substringScoreExpr} DESC`,
+        desc(schema.longTermMemoryChunks.createdAt),
+      )
+      .limit(options.candidateLimit);
+  }
+
+  const tsQueryExpr = sql`websearch_to_tsquery('simple', ${normalizedSearchText})`;
+  const keywordScoreExpr = sql<number>`coalesce(ts_rank(${schema.longTermMemoryChunks.tsv}, ${tsQueryExpr}, 32), 0)`;
+
+  const rows = await db
+    .select({
+      chunkId: schema.longTermMemoryChunks.id,
+      memoryId: schema.longTermMemoryChunks.memoryId,
+      content: schema.longTermMemoryChunks.content,
+      keywordScore: keywordScoreExpr,
+    })
+    .from(schema.longTermMemoryChunks)
+    .where(sql`${schema.longTermMemoryChunks.tsv} @@ ${tsQueryExpr}`)
+    .orderBy(sql`${keywordScoreExpr} DESC`)
+    .limit(options.candidateLimit);
+
+  if (rows.length > 0) {
+    return rows;
+  }
+
+  const substringScoreExpr = sql<number>`case when ${schema.longTermMemoryChunks.content} ilike ${likePattern} escape '\\' then 1 else 0 end`;
+
+  return db
+    .select({
+      chunkId: schema.longTermMemoryChunks.id,
+      memoryId: schema.longTermMemoryChunks.memoryId,
+      content: schema.longTermMemoryChunks.content,
+      keywordScore: substringScoreExpr,
+    })
+    .from(schema.longTermMemoryChunks)
+    .where(
+      sql`${schema.longTermMemoryChunks.content} ilike ${likePattern} escape '\\'`,
+    )
+    .orderBy(
+      sql`${substringScoreExpr} DESC`,
+      desc(schema.longTermMemoryChunks.createdAt),
+    )
+    .limit(options.candidateLimit);
+}
+
+export async function hybridSearchLongTermMemoryChunks(options: {
+  queryEmbedding?: number[];
+  queryEmbeddingModel?: string;
+  queryEmbeddingDimensions?: number;
+  searchText?: string;
+  minConfidence: number;
+  limit: number;
+  offset: number;
+}): Promise<HybridSearchRow[]> {
+  const {
+    queryEmbedding,
+    queryEmbeddingModel,
+    queryEmbeddingDimensions,
+    searchText,
+    minConfidence,
+    limit,
+    offset,
+  } = options;
+
+  const hasEmbedding = queryEmbedding && queryEmbedding.length > 0;
+  const vectorDimensions = queryEmbeddingDimensions ?? queryEmbedding?.length;
+  const canRunVectorSearch =
+    hasEmbedding &&
+    typeof queryEmbeddingModel === 'string' &&
+    queryEmbeddingModel.length > 0 &&
+    typeof vectorDimensions === 'number';
+  const normalizedSearchText = searchText?.trim() || '';
+  const hasTextSearch = normalizedSearchText.length > 0;
+  const candidateLimit = getHybridCandidateLimit({ limit, offset });
+
+  logger.info('hybrid_search:start', {
+    hasEmbedding,
+    hasTextSearch,
+    searchTextPreview: buildSearchTextPreview(normalizedSearchText),
+    queryEmbeddingModel: queryEmbeddingModel ?? null,
+    queryEmbeddingDimensions: vectorDimensions ?? null,
+    minConfidence,
+    limit,
+    offset,
+    candidateLimit,
+  });
+
+  if (!hasEmbedding && !hasTextSearch) {
+    logger.info('hybrid_search:empty_input');
+    return [];
+  }
+
+  if (!hasEmbedding && hasTextSearch) {
+    const keywordRows = await listKeywordCandidateRows({
+      searchText: normalizedSearchText,
+      candidateLimit,
+    });
+    const mergedRows = mergeHybridSearchCandidates({
+      vectorRows: [],
+      keywordRows,
+      minConfidence,
+      limit,
+      offset,
+    });
+
+    logger.info('hybrid_search:keyword_only', {
+      keywordCandidateCount: keywordRows.length,
+      resultCount: mergedRows.length,
+      topResults: summarizeHybridRows(mergedRows),
+    });
+
+    return mergedRows;
+  }
+
+  if (!canRunVectorSearch) {
+    if (!hasTextSearch) {
+      return [];
+    }
+
+    const keywordRows = await listKeywordCandidateRows({
+      searchText: normalizedSearchText,
+      candidateLimit,
+    });
+    const mergedRows = mergeHybridSearchCandidates({
+      vectorRows: [],
+      keywordRows,
+      minConfidence,
+      limit,
+      offset,
+    });
+
+    logger.info('hybrid_search:fallback_keyword_only', {
+      reason: 'vector_search_not_available',
+      keywordCandidateCount: keywordRows.length,
+      resultCount: mergedRows.length,
+      topResults: summarizeHybridRows(mergedRows),
+    });
+
+    return mergedRows;
+  }
+
+  const activeQueryEmbedding = queryEmbedding;
+  const activeEmbeddingModel = queryEmbeddingModel;
+  const activeVectorDimensions = vectorDimensions;
+
+  if (
+    !activeQueryEmbedding ||
+    activeQueryEmbedding.length === 0 ||
+    typeof activeEmbeddingModel !== 'string' ||
+    activeEmbeddingModel.length === 0 ||
+    typeof activeVectorDimensions !== 'number'
+  ) {
+    if (!hasTextSearch) {
+      return [];
+    }
+
+    const keywordRows = await listKeywordCandidateRows({
+      searchText: normalizedSearchText,
+      candidateLimit,
+    });
+    const mergedRows = mergeHybridSearchCandidates({
+      vectorRows: [],
+      keywordRows,
+      minConfidence,
+      limit,
+      offset,
+    });
+
+    logger.warn('hybrid_search:fallback_keyword_only', {
+      reason: 'vector_inputs_incomplete_after_guard',
+      keywordCandidateCount: keywordRows.length,
+      resultCount: mergedRows.length,
+      topResults: summarizeHybridRows(mergedRows),
+    });
+
+    return mergedRows;
+  }
+
+  const distanceExpr = cosineDistance(
+    schema.longTermMemoryChunks.embedding,
+    activeQueryEmbedding,
+  );
+  const vectorScoreExpr = sql<number>`greatest(0, 1 - (${distanceExpr}))`;
+  const vectorRows = await db
+    .select({
+      chunkId: schema.longTermMemoryChunks.id,
+      memoryId: schema.longTermMemoryChunks.memoryId,
+      content: schema.longTermMemoryChunks.content,
+      vectorScore: vectorScoreExpr,
+    })
+    .from(schema.longTermMemoryChunks)
+    .where(
+      and(
+        sql`${schema.longTermMemoryChunks.embedding} IS NOT NULL`,
+        eq(schema.longTermMemoryChunks.embeddingModel, activeEmbeddingModel),
+        eq(
+          schema.longTermMemoryChunks.embeddingDimensions,
+          activeVectorDimensions,
+        ),
+      ),
+    )
+    .orderBy(sql`${vectorScoreExpr} DESC`)
+    .limit(candidateLimit);
+
+  logger.info('hybrid_search:vector_candidates', {
+    queryEmbeddingModel: activeEmbeddingModel,
+    queryEmbeddingDimensions: activeVectorDimensions,
+    vectorCandidateCount: vectorRows.length,
+    topVectorCandidates: vectorRows.slice(0, 5).map((row) => ({
+      chunkId: row.chunkId,
+      memoryId: row.memoryId,
+      vectorScore: roundScore(row.vectorScore),
+    })),
+  });
+
+  if (!hasTextSearch) {
+    const mergedRows = mergeHybridSearchCandidates({
+      vectorRows,
+      keywordRows: [],
+      minConfidence,
+      limit,
+      offset,
+    });
+
+    logger.info('hybrid_search:vector_only', {
+      vectorCandidateCount: vectorRows.length,
+      resultCount: mergedRows.length,
+      topResults: summarizeHybridRows(mergedRows),
+    });
+
+    return mergedRows;
+  }
+
+  const keywordRows = await listKeywordCandidateRows({
+    searchText: normalizedSearchText,
+    candidateLimit,
+  });
+
+  logger.info('hybrid_search:keyword_candidates', {
+    keywordCandidateCount: keywordRows.length,
+    topKeywordCandidates: keywordRows.slice(0, 5).map((row) => ({
+      chunkId: row.chunkId,
+      memoryId: row.memoryId,
+      keywordScore: roundScore(row.keywordScore),
+    })),
+  });
+
+  const mergedRows = mergeHybridSearchCandidates({
+    vectorRows,
+    keywordRows,
+    minConfidence,
+    limit,
+    offset,
+  });
+
+  logger.info(
+    vectorRows.length === 0
+      ? 'hybrid_search:hybrid_no_vector_hits'
+      : 'hybrid_search:hybrid_result',
+    {
+      vectorCandidateCount: vectorRows.length,
+      keywordCandidateCount: keywordRows.length,
+      resultCount: mergedRows.length,
+      topResults: summarizeHybridRows(mergedRows),
+    },
+  );
+
+  return mergedRows;
+}

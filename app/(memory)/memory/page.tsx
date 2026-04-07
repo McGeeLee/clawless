@@ -1,0 +1,419 @@
+'use client';
+
+import { Loader2, Plus, Save, Trash2 } from 'lucide-react';
+import { ofetch } from 'ofetch';
+import { useCallback, useEffect, useState } from 'react';
+import { toast } from 'sonner';
+
+import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Textarea } from '@/components/ui/textarea';
+
+type Scope = 'builtin' | 'long_term' | 'session';
+
+const BUILTIN_KEYS = ['AGENTS', 'SOUL', 'IDENTITY', 'USER'] as const;
+
+interface BuiltinMemory {
+  key: string;
+  content: string;
+  updatedAt: string | null;
+}
+
+interface LongTermMemory {
+  id: string;
+  content: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface SessionSummary {
+  id: string;
+  sessionId: string;
+  content: string;
+  summaryVersion: number;
+  isCurrent: boolean;
+  createdAt: string;
+}
+
+interface BuiltinMemoryResponse {
+  sections?: BuiltinMemory[];
+}
+
+interface LongTermMemoryListResponse {
+  items?: LongTermMemory[];
+}
+
+export default function MemoryPage() {
+  const [activeScope, setActiveScope] = useState<Scope>('builtin');
+
+  return (
+    <div className="flex flex-col min-w-0 h-dvh bg-background">
+      <header className="flex sticky top-0 bg-background py-3 items-center px-4 border-b">
+        <h1 className="text-lg font-semibold">Memory</h1>
+      </header>
+
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {/* Scope tabs */}
+        <div className="flex flex-wrap items-center gap-2">
+          {(['builtin', 'long_term', 'session'] as Scope[]).map((scope) => (
+            <Button
+              key={scope}
+              size="sm"
+              variant={activeScope === scope ? 'default' : 'secondary'}
+              onClick={() => setActiveScope(scope)}
+            >
+              {scope === 'builtin'
+                ? 'Builtin'
+                : scope === 'long_term'
+                  ? 'Long-term'
+                  : 'Session'}
+            </Button>
+          ))}
+        </div>
+
+        {activeScope === 'builtin' && <BuiltinPanel />}
+        {activeScope === 'long_term' && <LongTermPanel />}
+        {activeScope === 'session' && <SessionPanel />}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Builtin Panel ─────────────────────────────────────────────── */
+
+function BuiltinPanel() {
+  const [memories, setMemories] = useState<Record<string, BuiltinMemory>>({});
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [loading, setLoading] = useState(true);
+  const [savingKey, setSavingKey] = useState<string | null>(null);
+
+  const loadBuiltin = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await ofetch<BuiltinMemoryResponse>('/api/memory/builtin');
+      const map: Record<string, BuiltinMemory> = {};
+      for (const m of data.sections ?? []) {
+        map[m.key] = m;
+      }
+      setMemories(map);
+      const d: Record<string, string> = {};
+      for (const key of BUILTIN_KEYS) {
+        d[key] = map[key]?.content ?? '';
+      }
+      setDrafts(d);
+    } catch {
+      toast.error('Failed to load builtin memories');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadBuiltin();
+  }, [loadBuiltin]);
+
+  async function saveKey(key: string) {
+    setSavingKey(key);
+    try {
+      await ofetch('/api/memory/builtin', {
+        method: 'PUT',
+        body: { key, content: drafts[key] ?? '' },
+      });
+      toast.success(`${key} saved`);
+      await loadBuiltin();
+    } catch {
+      toast.error(`Failed to save ${key}`);
+    } finally {
+      setSavingKey(null);
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center p-8">
+        <Loader2 className="size-6 animate-spin text-muted-foreground" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader className="space-y-3">
+          <p className="text-sm text-muted-foreground">
+            These built-in memories are used to build system prompts, making
+            your Agent customizable to you.
+          </p>
+        </CardHeader>
+      </Card>
+      {BUILTIN_KEYS.map((key) => (
+        <Card key={key}>
+          <CardHeader className="pb-2">
+            <CardTitle className="text-sm font-mono">{key}</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-2">
+            <Textarea
+              rows={4}
+              value={drafts[key] ?? ''}
+              onChange={(e) =>
+                setDrafts((prev) => ({ ...prev, [key]: e.target.value }))
+              }
+              placeholder={`${key} content...`}
+            />
+            <div className="flex items-center justify-between">
+              <span className="text-xs text-muted-foreground">
+                {memories[key]?.updatedAt
+                  ? `Updated: ${new Date(memories[key].updatedAt).toLocaleString()}`
+                  : 'Not set'}
+              </span>
+              <Button
+                size="sm"
+                disabled={savingKey === key}
+                onClick={() => saveKey(key)}
+              >
+                {savingKey === key ? (
+                  <Loader2 className="size-4 animate-spin mr-1" />
+                ) : (
+                  <Save className="size-4 mr-1" />
+                )}
+                Save
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      ))}
+    </div>
+  );
+}
+
+/* ─── Long-term Panel ───────────────────────────────────────────── */
+
+function LongTermPanel() {
+  const [memories, setMemories] = useState<LongTermMemory[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [newContent, setNewContent] = useState('');
+  const [deletingMap, setDeletingMap] = useState<Record<string, boolean>>({});
+
+  const loadMemories = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await ofetch<LongTermMemoryListResponse>(
+        '/api/memory/long-term?page=1&pageSize=100',
+      );
+      setMemories(data.items ?? []);
+    } catch {
+      toast.error('Failed to load long-term memories');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadMemories();
+  }, [loadMemories]);
+
+  async function create() {
+    const content = newContent.trim();
+    if (!content) return;
+    setCreating(true);
+    try {
+      const result = await ofetch<{
+        indexing?: { mode?: string };
+      }>('/api/memory/long-term', {
+        method: 'POST',
+        body: { content },
+      });
+      setNewContent('');
+      toast.success(
+        result.indexing?.mode === 'embedded'
+          ? 'Memory created and embedded'
+          : 'Memory created in keyword-only mode',
+      );
+      await loadMemories();
+    } catch {
+      toast.error('Failed to create memory');
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function remove(id: string) {
+    if (deletingMap[id]) return;
+    setDeletingMap((prev) => ({ ...prev, [id]: true }));
+    try {
+      await ofetch(`/api/memory/long-term/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+      });
+      setMemories((prev) => prev.filter((m) => m.id !== id));
+      toast.success('Memory deleted');
+    } catch {
+      toast.error('Failed to delete memory');
+    } finally {
+      setDeletingMap((prev) => ({ ...prev, [id]: false }));
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Add Long-term Memory</CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Claw can remember your preferences and knowledge across this
+            single-user project.
+          </p>
+          <p className="text-sm text-muted-foreground">
+            Setting the <span className="font-medium">embedding model</span> in
+            the AI configuration can make retrieval more accurate, but memory
+            still saves even if embeddings are unavailable.
+          </p>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <Textarea
+            rows={3}
+            value={newContent}
+            onChange={(e) => setNewContent(e.target.value)}
+            placeholder="Memory content..."
+          />
+          <div className="flex justify-end">
+            <Button onClick={create} disabled={creating}>
+              {creating ? (
+                <Loader2 className="size-4 animate-spin mr-1" />
+              ) : (
+                <Plus className="size-4 mr-1" />
+              )}
+              Add
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      {loading ? (
+        <div className="flex items-center justify-center p-8">
+          <Loader2 className="size-6 animate-spin text-muted-foreground" />
+        </div>
+      ) : memories.length === 0 ? (
+        <div className="text-sm text-muted-foreground p-6 border border-dashed rounded-lg text-center">
+          No long-term memories yet
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {memories.map((item) => (
+            <Card key={item.id}>
+              <CardContent className="pt-4 space-y-2">
+                <p className="text-sm whitespace-pre-wrap">{item.content}</p>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs text-muted-foreground">
+                    {new Date(item.createdAt).toLocaleString()}
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-destructive"
+                    disabled={deletingMap[item.id]}
+                    onClick={() => remove(item.id)}
+                  >
+                    {deletingMap[item.id] ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <Trash2 className="size-4" />
+                    )}
+                    <span className="ml-1">Delete</span>
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── Session Panel ─────────────────────────────────────────────── */
+
+function SessionPanel() {
+  const [sessionId, setSessionId] = useState('');
+  const [summaries, setSummaries] = useState<SessionSummary[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  async function loadSummaries() {
+    const sid = sessionId.trim();
+    if (!sid) {
+      toast.error('Enter a session ID');
+      return;
+    }
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ sessionId: sid });
+      const data = await ofetch<{
+        summaries?: SessionSummary[];
+      }>(`/api/memory/session?${params.toString()}`);
+      setSummaries(data.summaries ?? []);
+    } catch {
+      toast.error('Failed to load session summaries');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Session Summaries</CardTitle>
+          <p className="text-sm text-muted-foreground">
+            Session memory is isolated within each session, which is especially
+            useful for long sessions.
+          </p>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="flex gap-2">
+            <Input
+              value={sessionId}
+              onChange={(e) => setSessionId(e.target.value)}
+              placeholder="Session ID"
+              className="flex-1"
+            />
+            <Button onClick={loadSummaries} disabled={loading}>
+              {loading ? <Loader2 className="size-4 animate-spin" /> : 'Load'}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      {summaries.length === 0 ? (
+        <div className="text-sm text-muted-foreground p-6 border border-dashed rounded-lg text-center">
+          {sessionId.trim()
+            ? 'No summaries for this session'
+            : 'Enter a session ID to view summaries'}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {summaries.map((s) => (
+            <Card key={s.id}>
+              <CardContent className="pt-4 space-y-2">
+                <div className="flex items-center gap-2">
+                  <code className="px-2 py-0.5 rounded bg-muted text-xs">
+                    v{s.summaryVersion}
+                  </code>
+                  {s.isCurrent && (
+                    <span className="text-xs font-medium text-green-600">
+                      current
+                    </span>
+                  )}
+                </div>
+                <p className="text-sm whitespace-pre-wrap">{s.content}</p>
+                <span className="text-xs text-muted-foreground block">
+                  {new Date(s.createdAt).toLocaleString()}
+                </span>
+              </CardContent>
+            </Card>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

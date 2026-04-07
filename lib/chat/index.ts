@@ -1,0 +1,829 @@
+import { sendAdapterSourceReply } from '@/lib/bot/reply';
+import {
+  createSession,
+  deleteMessagesAfterUiMessageId,
+  getFirstVisibleSessionMessage,
+  getSession,
+  getSessionByExternalThreadId,
+  listSessionsByExternalThreadIds,
+  updateSession,
+  upsertUserMessage,
+} from '@/lib/core/db/chat';
+import { getConfig } from '@/lib/core/kv/config';
+import { getSessionRuntime } from '@/lib/core/sandbox/session-runtime';
+import { invalidateCurrentSessionSummary } from '@/lib/memory';
+import { generateUUID } from '@/lib/utils';
+import { buildInitialContextMessages } from '@/lib/workflow/agent/context';
+import {
+  canResumeRun,
+  pauseWorkflow,
+  requestCompact,
+  resumeToolApproval,
+  resumeWithMessage,
+  startWorkflow,
+} from '@/lib/workflow/agent/dispatch';
+import type { AdapterName } from '@/types/config/channels';
+import {
+  type ChatInputEnvelope,
+  type ChatSource,
+  type Command,
+  type WorkflowUIMessage,
+  type WorkflowUIMessageChunk,
+  buildExternalThreadId,
+  normalizeMessageText,
+  parseChatInputEnvelope,
+} from '@/types/workflow';
+import { normalizeUserMessageParts } from './attachment-processing';
+import { serializeUserMessage } from './message-utils';
+import { deriveSessionTitle } from './session-title';
+
+type Trigger = 'submit-message' | 'regenerate-message' | 'route-message';
+
+export type DispatchChatInputResult =
+  | {
+      kind: 'message';
+      result: {
+        sessionId: string;
+        runId: string;
+        readable: ReadableStream<WorkflowUIMessageChunk>;
+      };
+    }
+  | {
+      kind: 'resume-run-message';
+      result: {
+        sessionId: string;
+        runId: string;
+      };
+    }
+  | {
+      kind: 'command';
+      result: {
+        sessionId: string;
+        text: string;
+        readable?: ReadableStream<WorkflowUIMessageChunk>;
+        runId?: string | null;
+      };
+    };
+
+type LegacyChatMainRequest = {
+  trigger: Trigger;
+  input: {
+    parts?: ChatInputEnvelope['parts'];
+    text?: string;
+  };
+  messages?: WorkflowUIMessage[];
+  sessionId?: string;
+  uiMessageId?: string;
+};
+
+type ChatMainOptions = {
+  source?: ChatSource;
+  channel?: string;
+  externalThreadId?: string;
+  userId?: string;
+  workflowSource?: 'scheduled';
+};
+
+type AdapterMessageInput = {
+  adapter: AdapterName;
+  origin: string;
+  threadId: string;
+  userId?: string | null;
+  userName?: string | null;
+  text: string;
+  parts?: ChatInputEnvelope['parts'];
+};
+
+type SessionRecord = Awaited<ReturnType<typeof getSession>> | null;
+
+const COMMAND_HELP_TEXT = [
+  'Available slash commands:',
+  '/help - Show slash command help',
+  '/status - Show the current session status',
+  '/new - Create and switch to a new session',
+  '/session - Show the current bound session',
+  '/session <session-id> - Switch to an existing session',
+  '/stop - Stop the active workflow run',
+  '/compact - Request context compaction',
+  '/approve <toolCallId> [note] - Approve a pending tool call',
+  '/reject <toolCallId> [note] - Reject a pending tool call',
+].join('\n\n');
+
+function normalizeSource(options?: ChatMainOptions): ChatSource {
+  if (options?.source) {
+    return options.source;
+  }
+
+  if (options?.workflowSource === 'scheduled') {
+    return { type: 'scheduled' };
+  }
+
+  return { type: 'web' };
+}
+
+function buildAdapterSource(
+  input: Omit<AdapterMessageInput, 'text' | 'parts'>,
+): Extract<ChatSource, { type: 'im' }> {
+  return {
+    type: 'im',
+    adapter: input.adapter,
+    origin: input.origin,
+    threadId: input.threadId,
+    userId: input.userId ?? null,
+    userName: input.userName ?? null,
+  };
+}
+
+function buildLegacyExternalThreadId(source: ChatSource): string | null {
+  if (source.type !== 'im') {
+    return null;
+  }
+
+  return source.threadId;
+}
+
+function getImExternalThreadIds(source: Extract<ChatSource, { type: 'im' }>) {
+  const canonical = buildExternalThreadId(source);
+  const legacy = buildLegacyExternalThreadId(source);
+
+  return [canonical, legacy].filter(
+    (value, index, array): value is string =>
+      typeof value === 'string' &&
+      value.length > 0 &&
+      array.indexOf(value) === index,
+  );
+}
+
+async function lookupSessionByImSource(
+  source: Extract<ChatSource, { type: 'im' }>,
+): Promise<SessionRecord> {
+  const [canonicalExternalThreadId, legacyExternalThreadId] =
+    getImExternalThreadIds(source);
+
+  if (!canonicalExternalThreadId) {
+    return null;
+  }
+
+  const direct = await getSessionByExternalThreadId(canonicalExternalThreadId);
+  if (direct) {
+    return direct;
+  }
+
+  if (!legacyExternalThreadId) {
+    return null;
+  }
+
+  const legacy = await getSessionByExternalThreadId(legacyExternalThreadId);
+  if (!legacy) {
+    return null;
+  }
+
+  return (
+    (await updateSession(legacy.id, {
+      channel: source.adapter,
+      externalThreadId: canonicalExternalThreadId,
+      userId: source.userId ?? null,
+      metadata: {
+        ...(legacy.metadata ?? {}),
+        source,
+      },
+    })) ?? legacy
+  );
+}
+
+async function bindImSourceToSession(
+  source: Extract<ChatSource, { type: 'im' }>,
+  sessionId: string,
+): Promise<SessionRecord> {
+  const externalThreadIds = getImExternalThreadIds(source);
+  const [canonicalExternalThreadId] = externalThreadIds;
+
+  if (!canonicalExternalThreadId) {
+    return getSession(sessionId);
+  }
+
+  const [target, sessions] = await Promise.all([
+    getSession(sessionId),
+    listSessionsByExternalThreadIds(externalThreadIds),
+  ]);
+
+  if (!target) {
+    return null;
+  }
+
+  await Promise.all(
+    sessions
+      .filter((session) => session.id !== sessionId)
+      .map((session) => updateSession(session.id, { externalThreadId: null })),
+  );
+
+  return (
+    (await updateSession(sessionId, {
+      channel: source.adapter,
+      externalThreadId: canonicalExternalThreadId,
+      userId: source.userId ?? null,
+      metadata: {
+        ...(target.metadata ?? {}),
+        source,
+      },
+    })) ?? target
+  );
+}
+
+async function ensureMessageSession(input: {
+  sessionId?: string;
+  source: ChatSource;
+}) {
+  const externalThreadId = buildExternalThreadId(input.source);
+
+  if (input.sessionId) {
+    const existing = await getSession(input.sessionId);
+    if (existing) {
+      return existing;
+    }
+
+    return createSession({
+      id: input.sessionId,
+      channel:
+        input.source.type === 'im' ? input.source.adapter : input.source.type,
+      externalThreadId,
+      userId: input.source.type === 'im' ? (input.source.userId ?? null) : null,
+      metadata: {
+        source: input.source,
+      },
+    });
+  }
+
+  if (input.source.type === 'im') {
+    const existing = await lookupSessionByImSource(input.source);
+    if (existing) {
+      return existing;
+    }
+  }
+
+  return createSession({
+    channel:
+      input.source.type === 'im' ? input.source.adapter : input.source.type,
+    externalThreadId,
+    userId: input.source.type === 'im' ? (input.source.userId ?? null) : null,
+    metadata: {
+      source: input.source,
+    },
+  });
+}
+
+async function resolveCommandSession(input: {
+  sessionId?: string;
+  source: ChatSource;
+}) {
+  if (input.sessionId) {
+    return getSession(input.sessionId);
+  }
+
+  if (input.source.type === 'im') {
+    return lookupSessionByImSource(input.source);
+  }
+
+  return null;
+}
+
+async function maybeAssignSessionTitle(input: {
+  session: NonNullable<SessionRecord>;
+  uiMessageId: string;
+  text: string;
+}) {
+  if (input.session.title) {
+    return;
+  }
+
+  const title = deriveSessionTitle(input.text);
+  if (!title) {
+    return;
+  }
+
+  const firstVisibleMessage = await getFirstVisibleSessionMessage(
+    input.session.id,
+  );
+  if (firstVisibleMessage?.uiMessageId !== input.uiMessageId) {
+    return;
+  }
+
+  await updateSession(input.session.id, { title });
+}
+
+function extractTextFromParsedChunk(chunk: unknown): string[] {
+  if (!chunk || typeof chunk !== 'object') return [];
+
+  const payload = chunk as Record<string, unknown>;
+  if (payload.type === 'text-delta') {
+    const delta = payload.delta ?? payload.textDelta;
+    return typeof delta === 'string' ? [delta] : [];
+  }
+
+  if (payload.type === 'text') {
+    return typeof payload.text === 'string' ? [payload.text] : [];
+  }
+
+  return [];
+}
+
+async function readTextFromReadableStream(
+  stream: ReadableStream,
+): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffered = '';
+  let text = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      if (value instanceof Uint8Array) {
+        buffered += decoder.decode(value, { stream: true });
+        const lines = buffered.split(/\r?\n/);
+        buffered = lines.pop() ?? '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+
+          const rawData = trimmed.startsWith('data:')
+            ? trimmed.slice(5).trim()
+            : trimmed;
+          if (!rawData || rawData === '[DONE]') continue;
+
+          try {
+            text += extractTextFromParsedChunk(JSON.parse(rawData)).join('');
+          } catch {
+            continue;
+          }
+        }
+        continue;
+      }
+
+      text += extractTextFromParsedChunk(value).join('');
+    }
+
+    buffered += decoder.decode();
+    for (const line of buffered.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      const rawData = trimmed.startsWith('data:')
+        ? trimmed.slice(5).trim()
+        : trimmed;
+      if (!rawData || rawData === '[DONE]') continue;
+
+      try {
+        text += extractTextFromParsedChunk(JSON.parse(rawData)).join('');
+      } catch {
+        continue;
+      }
+    }
+
+    return text.trim();
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function replyToAdapterCommandResult(
+  dispatched: DispatchChatInputResult,
+  source: Extract<ChatSource, { type: 'im' }>,
+): Promise<void> {
+  if (dispatched.kind !== 'command') {
+    return;
+  }
+
+  const text = dispatched.result.readable
+    ? await readTextFromReadableStream(dispatched.result.readable)
+    : dispatched.result.text;
+
+  await sendAdapterSourceReply(source, text);
+}
+
+export async function routeAdapterMessage(
+  input: AdapterMessageInput,
+): Promise<DispatchChatInputResult> {
+  const source = buildAdapterSource(input);
+  const dispatched = await chatMain(
+    {
+      trigger: 'route-message',
+      input: {
+        parts: input.parts ?? [{ type: 'text', text: input.text }],
+        text: input.text,
+      },
+    },
+    { source },
+  );
+
+  await replyToAdapterCommandResult(dispatched, source);
+  return dispatched;
+}
+
+async function executeCommand(input: {
+  command: Command;
+  args: string;
+  currentSession: SessionRecord;
+  requestedSessionId?: string;
+  source: ChatSource;
+}) {
+  const session = input.currentSession;
+  const runtime = session ? await getSessionRuntime(session.id) : null;
+  const currentSessionId = session?.id ?? input.requestedSessionId ?? 'none';
+
+  switch (input.command) {
+    case 'help':
+      return {
+        sessionId: currentSessionId,
+        text: COMMAND_HELP_TEXT,
+        runId: session?.workflowRunId ?? null,
+      };
+    case 'status': {
+      if (!session) {
+        return {
+          sessionId: 'none',
+          text: 'No session is currently bound to this thread.',
+          runId: null,
+        };
+      }
+
+      const source = session.metadata?.source as
+        | Record<string, unknown>
+        | undefined;
+      const sourceText =
+        source && source.type === 'im'
+          ? `im:${String(source.adapter)} origin=${String(source.origin)} thread=${String(source.threadId)}`
+          : (session.channel ?? 'web');
+      const latestApproval =
+        (session.metadata?.latestApproval as
+          | {
+              toolCallId?: string;
+              toolName?: string;
+              status?: string;
+            }
+          | undefined) ?? undefined;
+
+      return {
+        sessionId: session.id,
+        text: [
+          `session=${session.id}`,
+          `run=${runtime?.workflow.runId ?? 'none'}`,
+          `status=${runtime?.workflow.status ?? 'idle'}`,
+          `phase=${runtime?.workflow.phase ?? 'idle'}`,
+          `model=${session.model ?? 'unset'}`,
+          `tokens=${session.totalTokens ?? 0}`,
+          `source=${sourceText}`,
+          latestApproval?.toolCallId
+            ? `approval=${latestApproval.status ?? 'pending'} ${latestApproval.toolName ?? ''} ${latestApproval.toolCallId}`.trim()
+            : 'approval=none',
+        ].join('\n\n'),
+        runId: session.workflowRunId ?? null,
+      };
+    }
+    case 'session': {
+      if (!input.args) {
+        return {
+          sessionId: currentSessionId,
+          text: `current-session=${currentSessionId}`,
+          runId: session?.workflowRunId ?? null,
+        };
+      }
+
+      if (input.source.type !== 'im') {
+        return {
+          sessionId: currentSessionId,
+          text: 'Session switching is only available for IM threads.',
+          runId: session?.workflowRunId ?? null,
+        };
+      }
+
+      const target = await getSession(input.args);
+      if (!target) {
+        return {
+          sessionId: currentSessionId,
+          text: `Session ${input.args} was not found.`,
+          runId: session?.workflowRunId ?? null,
+        };
+      }
+
+      const rebound = await bindImSourceToSession(input.source, target.id);
+
+      return {
+        sessionId: rebound?.id ?? target.id,
+        text: `Switched to session ${target.id}.`,
+        runId: target.workflowRunId ?? null,
+      };
+    }
+    case 'stop': {
+      if (!session) {
+        return {
+          sessionId: 'none',
+          text: 'No session is currently bound to this thread.',
+          runId: null,
+        };
+      }
+
+      if (!runtime?.workflow.runId) {
+        return {
+          sessionId: session.id,
+          text: 'No active workflow run.',
+          runId: null,
+        };
+      }
+
+      await pauseWorkflow(runtime.workflow.runId);
+      return {
+        sessionId: session.id,
+        text: `Stopped workflow run ${runtime.workflow.runId}.`,
+        runId: null,
+      };
+    }
+    case 'compact': {
+      if (!session) {
+        return {
+          sessionId: 'none',
+          text: 'No session is currently bound to this thread.',
+          runId: null,
+        };
+      }
+
+      if (!runtime?.workflow.runId) {
+        return {
+          sessionId: session.id,
+          text: 'No active workflow run to compact.',
+          runId: null,
+        };
+      }
+
+      const queued = await requestCompact(runtime.workflow.runId);
+      if (!queued) {
+        return {
+          sessionId: session.id,
+          text: 'No active workflow run to compact.',
+          runId: null,
+        };
+      }
+
+      return {
+        sessionId: session.id,
+        text: `Queued compaction for run ${runtime.workflow.runId}.`,
+        runId: session.workflowRunId ?? null,
+      };
+    }
+    case 'approve':
+    case 'reject': {
+      if (!session) {
+        return {
+          sessionId: 'none',
+          text: 'No session is currently bound to this thread.',
+          runId: null,
+        };
+      }
+
+      const pending =
+        (session.metadata?.latestApproval as
+          | { toolCallId?: string; status?: string; hookToken?: string }
+          | undefined) ?? undefined;
+      const [explicitToolCallId = '', ...rest] = input.args.split(/\s+/);
+      const comment = rest.join(' ').trim();
+      const toolCallId = explicitToolCallId || pending?.toolCallId || '';
+      const candidateHookTokens = Array.from(
+        new Set(
+          [
+            pending?.hookToken,
+            runtime?.workflow.runId
+              ? `${runtime.workflow.runId}:${toolCallId}`
+              : undefined,
+            toolCallId,
+          ].filter((value): value is string => Boolean(value)),
+        ),
+      );
+
+      if (!toolCallId) {
+        return {
+          sessionId: session.id,
+          text: `No pending approval found for /${input.command}.`,
+          runId: session.workflowRunId ?? null,
+        };
+      }
+
+      let resolvedHookToken: string | null = null;
+      let lastResumeError: unknown = null;
+
+      for (const hookToken of candidateHookTokens) {
+        try {
+          await resumeToolApproval(hookToken, {
+            approved: input.command === 'approve',
+            comment: comment || undefined,
+            toolCallId,
+          });
+          resolvedHookToken = hookToken;
+          break;
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : String(error);
+          if (!message.toLowerCase().includes('hook not found')) {
+            throw error;
+          }
+          lastResumeError = error;
+        }
+      }
+
+      if (!resolvedHookToken) {
+        throw (
+          lastResumeError ??
+          new Error('No matching approval hook was found for this tool call.')
+        );
+      }
+
+      await updateSession(session.id, {
+        metadata: {
+          ...(session.metadata ?? {}),
+          latestApproval: {
+            toolCallId,
+            hookToken: resolvedHookToken,
+            status: input.command === 'approve' ? 'approved' : 'rejected',
+            comment: comment || null,
+          },
+        },
+      });
+
+      return {
+        sessionId: session.id,
+        text: `${input.command === 'approve' ? 'Approved' : 'Rejected'} ${toolCallId}.`,
+        runId: session.workflowRunId ?? null,
+      };
+    }
+    case 'new': {
+      if (input.source.type === 'im') {
+        const next = await createSession({
+          channel: input.source.adapter,
+          userId: input.source.userId ?? null,
+          metadata: {
+            source: input.source,
+          },
+        });
+        const rebound = await bindImSourceToSession(input.source, next.id);
+
+        return {
+          sessionId: rebound?.id ?? next.id,
+          text: `Created and switched to session ${next.id}.`,
+          runId: null,
+        };
+      }
+
+      const next = await createSession({
+        channel: session?.channel ?? 'web',
+      });
+
+      return {
+        sessionId: next.id,
+        text: `Created session ${next.id}.`,
+        runId: null,
+      };
+    }
+    default:
+      return {
+        sessionId: currentSessionId,
+        text: `Unsupported command: /${input.command}`,
+        runId: session?.workflowRunId ?? null,
+      };
+  }
+}
+
+export async function chatMain(
+  request: LegacyChatMainRequest,
+  options?: ChatMainOptions,
+): Promise<DispatchChatInputResult> {
+  const source = normalizeSource(options);
+
+  const envelope = parseChatInputEnvelope({
+    sessionId: request.sessionId,
+    uiMessageId: request.uiMessageId ?? generateUUID(),
+    parts: request.input.parts,
+    text: request.input.text,
+    source,
+  });
+
+  if (envelope.kind === 'command') {
+    const currentSession = await resolveCommandSession({
+      sessionId: envelope.sessionId,
+      source: envelope.source,
+    });
+    const command = await executeCommand({
+      command: envelope.command,
+      args: envelope.args,
+      currentSession,
+      requestedSessionId: envelope.sessionId,
+      source: envelope.source,
+    });
+
+    return {
+      kind: 'command',
+      result: {
+        sessionId: command.sessionId,
+        text: command.text,
+        runId: command.runId ?? null,
+      },
+    };
+  }
+
+  const session = await ensureMessageSession({
+    sessionId: envelope.sessionId,
+    source: envelope.source,
+  });
+  const isRegenerate = request.trigger === 'regenerate-message';
+
+  if (isRegenerate && session.workflowRunId) {
+    const resumable = await canResumeRun(session.workflowRunId);
+    if (resumable) {
+      await pauseWorkflow(session.workflowRunId);
+    }
+  }
+
+  const normalizedInput = await normalizeUserMessageParts({
+    sessionId: session.id,
+    parts: envelope.parts,
+    source: envelope.source,
+  });
+  const normalizedText = normalizeMessageText(
+    envelope.text || normalizedInput.text,
+  );
+
+  const nextUiMessageId = envelope.uiMessageId ?? generateUUID();
+  await upsertUserMessage(
+    serializeUserMessage({
+      sessionId: session.id,
+      uiMessageId: nextUiMessageId,
+      text: normalizedText,
+      parts: normalizedInput.parts,
+      attachments: normalizedInput.attachments,
+      source: envelope.source,
+    }),
+  );
+
+  const truncated = await deleteMessagesAfterUiMessageId(
+    session.id,
+    nextUiMessageId,
+  );
+  if (isRegenerate || truncated.length > 0) {
+    await invalidateCurrentSessionSummary(session.id);
+    await updateSession(session.id, {
+      metadata: {
+        ...(session.metadata ?? {}),
+        contextUsage: null,
+        latestApproval: null,
+      },
+    });
+  }
+  await maybeAssignSessionTitle({
+    session,
+    uiMessageId: nextUiMessageId,
+    text: normalizedText,
+  });
+
+  if (
+    !isRegenerate &&
+    session.workflowRunId &&
+    (await canResumeRun(session.workflowRunId))
+  ) {
+    await resumeWithMessage(session.workflowRunId, {
+      type: 'user-message',
+      message: normalizedText,
+      parts: normalizedInput.parts,
+      uiMessageId: nextUiMessageId,
+    });
+
+    return {
+      kind: 'resume-run-message',
+      result: {
+        sessionId: session.id,
+        runId: session.workflowRunId,
+      },
+    };
+  }
+
+  const config = await getConfig();
+  const initialMessages = await buildInitialContextMessages(session.id, {
+    modelId: config.models?.model ?? null,
+  });
+
+  const { runId, readable } = await startWorkflow({
+    sessionId: session.id,
+    initialMessages,
+    config,
+    source: envelope.source,
+  });
+
+  return {
+    kind: 'message',
+    result: {
+      sessionId: session.id,
+      runId,
+      readable,
+    },
+  };
+}
