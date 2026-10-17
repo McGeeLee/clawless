@@ -11,6 +11,7 @@
   "files": {
     "ignore": [
       "**/bun.lock",
+      "**/next-env.d.ts",
       "node_modules",
       ".next",
       "public",

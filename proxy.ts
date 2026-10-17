@@ -28,7 +28,7 @@ function isAlwaysBypassPath(pathname: string): boolean {
   return isPublicAssetPath(pathname);
 }
 
-export async function middleware(request: NextRequest) {
+export async function proxy(request: NextRequest) {
   const { pathname, search } = request.nextUrl;
 
   if (isLoginPath(pathname) || isAlwaysBypassPath(pathname)) {

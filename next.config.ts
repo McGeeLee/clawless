@@ -3,6 +3,10 @@ import { withWorkflow } from 'workflow/next';
 
 const nextConfig: NextConfig = {
   serverExternalPackages: ['@vercel/queue'],
+  experimental: {
+    webpackBuildWorker: true,
+    webpackMemoryOptimizations: true,
+  },
   async headers() {
     return [
       {

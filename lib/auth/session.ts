@@ -142,8 +142,12 @@ export async function verifyAuthToken(
     return null;
   }
 
-  const isValid = await verifySignature(payload, signature, secret);
-  if (!isValid) {
+  // Malformed, untrusted cookie signatures must fail closed, not throw a 500.
+  try {
+    if (!(await verifySignature(payload, signature, secret))) {
+      return null;
+    }
+  } catch {
     return null;
   }
 
