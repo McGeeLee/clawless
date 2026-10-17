@@ -1,17 +1,17 @@
 {
   "dependencies": {
     "gray-matter": "^4.0.3",
-    "next": "15.5.9",
-    "react": "^19.0.0",
-    "react-dom": "^19.0.0",
+    "next": "16.4.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
     "react-markdown": "^9.0.1",
     "rehype-raw": "^7.0.0",
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@types/node": "^22.19.15",
-    "@types/react": "^18.3.28",
-    "@types/react-dom": "^18.3.7",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
     "typescript": "^5.9.3"
   },
   "name": "claw-less-docs",
@@ -22,5 +22,8 @@
     "start": "next start",
     "typecheck": "tsc --noEmit"
   },
-  "version": "0.1.0"
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=20.9.0"
+  }
 }

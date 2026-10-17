@@ -11,8 +11,8 @@
 ## 技术栈
 
 ### 前端框架与库
-- **Next.js 15.5.9** - React meta framework，支持 RSC（React Server Components）、路由、API 路由
-- **React 19.0.0** - UI 库
+- **Next.js 16.4.2** - React meta framework，支持 RSC（React Server Components）、路由、API 路由
+- **React 19.3.1** - UI 库
 - **TypeScript 5.9.3** - 类型安全的编程语言
 - **Tailwind CSS 3.4.19** - Utility-first CSS 框架
 - **shadcn/ui** - 基于 Radix UI 和 Tailwind CSS 的组件库
@@ -48,7 +48,7 @@
 - **@vercel/blob 2.3.1** - Vercel Blob 存储
 
 ### 工作流与后端
-- **Workflow SDK** - Vercel Workflow DevKit（4.2.0-beta.67）
+- **Workflow SDK** - Vercel Workflow DevKit（5.2.2）
   - `@workflow/ai` - Workflow 内 AI 支持
   - 支持可恢复、持久化的工作流执行
 - **@vercel/sandbox 1.8.1** - 代码执行沙箱环境
@@ -78,7 +78,7 @@
 
 ### 包管理器
 - **Bun** - 高性能 JavaScript 运行时与包管理器
-  - 使用 `bun.lockb` 作为锁定文件
+  - 使用 `bun.lock` 作为锁定文件
   - 支持 TypeScript 原生执行
 
 ### 配置文件
@@ -87,7 +87,7 @@
 - `next.config.ts` - Next.js 配置
 - `tailwind.config.ts` - Tailwind CSS 配置
 - `drizzle.config.ts` - Drizzle ORM 配置
-- `middleware.ts` - Next.js 中间件
+- `proxy.ts` - Next.js 中间件
 - `postcss.config.mjs` - PostCSS 配置
 - `components.json` - shadcn/ui 组件配置
 - `skills-lock.json` - 技能版本锁定文件
